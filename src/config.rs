@@ -31,7 +31,7 @@ pub enum Mode {
         payload_size: u16,
 
         /// Rate multiplier - converge to bandwidth * multiplier
-        #[arg(short, long, default_value_t = 2.0)]
+        #[arg(short, long, default_value_t = 1.5)]
         multiplier: f64,
 
         /// Enable retransmission mode (re-send lost packets)
@@ -110,12 +110,28 @@ impl TestParams {
 }
 
 pub fn parse_server_addr(s: &str) -> (Ipv4Addr, u16) {
-    if let Some((addr_str, port_str)) = s.rsplit_once(':') {
-        let addr: Ipv4Addr = addr_str.parse().expect("Invalid server IP address");
+    let (host, port) = if let Some((addr_str, port_str)) = s.rsplit_once(':') {
         let port: u16 = port_str.parse().expect("Invalid port number");
-        (addr, port)
+        (addr_str.to_string(), port)
     } else {
-        let addr: Ipv4Addr = s.parse().expect("Invalid server IP address");
-        (addr, 5201)
+        (s.to_string(), 5201)
+    };
+
+    // Try parsing as IPv4 first, then fall back to DNS resolution
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return (ip, port);
     }
+
+    use std::net::ToSocketAddrs;
+    let addr_str = format!("{host}:0");
+    for addr in addr_str
+        .to_socket_addrs()
+        .unwrap_or_else(|e| panic!("Failed to resolve '{host}': {e}"))
+    {
+        if let std::net::SocketAddr::V4(v4) = addr {
+            eprintln!("Resolved {host} -> {}", v4.ip());
+            return (*v4.ip(), port);
+        }
+    }
+    panic!("No IPv4 address found for '{host}'");
 }

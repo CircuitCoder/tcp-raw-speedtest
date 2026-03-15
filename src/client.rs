@@ -203,34 +203,38 @@ pub fn run_client(config: TestConfig, src_port: u16, shutdown: Arc<AtomicBool>) 
             let mut prev_ack = initial_seq;
             let rto = Duration::from_millis(500);
 
+            // Time-based pacing: track how many packets we should have sent
+            // by now, and burst-send to catch up. This avoids sleep granularity
+            // issues that cap throughput well below the desired rate.
+            let mut last_pace_check = Instant::now();
+            let mut pace_debt: f64 = 0.0; // fractional packet debt
+
             while !send_shutdown.load(Ordering::Relaxed)
                 && send_counters.state.load(Ordering::Relaxed) == 1
             {
                 let rate_mpps = send_counters.rate_millipps.load(Ordering::Relaxed);
-                let interval_ns = if rate_mpps > 0 {
-                    1_000_000_000_000u64 / rate_mpps // ns per packet
-                } else {
-                    100_000_000 // 100ms default
-                };
+                let rate_pps = rate_mpps as f64 / 1000.0;
+
+                // How many packets should we have sent since last check?
+                let dt = last_pace_check.elapsed().as_secs_f64();
+                pace_debt += dt * rate_pps;
+                last_pace_check = Instant::now();
 
                 // In retransmit mode, check if we need to retransmit
                 if retransmit {
                     let current_ack = send_counters.last_ack_num.load(Ordering::Relaxed);
                     let dup_acks = send_counters.dup_ack_count.load(Ordering::Relaxed);
 
-                    // Track ACK advancement for RTO
                     if current_ack != prev_ack {
                         last_ack_advance = Instant::now();
                         prev_ack = current_ack;
                     }
 
-                    // Fast retransmit (3 dup ACKs) or RTO
                     let need_retransmit = dup_acks >= 3
                         || (wrapping_gt(seq, current_ack)
                             && last_ack_advance.elapsed() > rto);
 
                     if need_retransmit && wrapping_gt(seq, current_ack) {
-                        // Retransmit from current_ack position
                         let retransmit_pkt = build_tcp_packet(
                             local_ip, config.server_addr, src_port, config.server_port,
                             current_ack, out_ack.0.load(Ordering::Relaxed),
@@ -240,43 +244,60 @@ pub fn run_client(config: TestConfig, src_port: u16, shutdown: Arc<AtomicBool>) 
                             send_counters.retransmit_count.fetch_add(1, Ordering::Relaxed);
                             send_counters.interval_retransmits.fetch_add(1, Ordering::Relaxed);
                         }
-                        // Reset dup ack count after retransmit
                         send_counters.dup_ack_count.store(0, Ordering::Relaxed);
                         last_ack_advance = Instant::now();
-
-                        // Rate-limit retransmissions
-                        if interval_ns > 10_000 {
-                            thread::sleep(Duration::from_nanos(interval_ns));
-                        }
+                        pace_debt = (pace_debt - 1.0).max(0.0);
                         continue;
                     }
                 }
 
-                // Send new data
-                let pkt = build_tcp_packet(
-                    local_ip, config.server_addr, src_port, config.server_port,
-                    seq, out_ack.0.load(Ordering::Relaxed), TcpFlags::ACK | TcpFlags::PSH, 65535, &payload,
-                );
-
-                if let Err(e) = sender.send_to(&pkt, dst) {
-                    warn!("Send error: {e}");
-                    thread::sleep(Duration::from_millis(1));
+                if pace_debt < 1.0 {
+                    // Not enough debt to send a packet, yield briefly
+                    let interval_ns = if rate_mpps > 0 {
+                        1_000_000_000_000u64 / rate_mpps
+                    } else {
+                        100_000_000
+                    };
+                    if interval_ns > 100_000 {
+                        thread::sleep(Duration::from_micros(50));
+                    } else {
+                        std::hint::spin_loop();
+                    }
                     continue;
                 }
 
-                send_counters.interval_sent.fetch_add(1, Ordering::Relaxed);
-                send_counters.total_sent.fetch_add(1, Ordering::Relaxed);
-                send_counters.interval_bytes_sent.fetch_add(payload_size as u64, Ordering::Relaxed);
-                send_counters.total_bytes_sent.fetch_add(payload_size as u64, Ordering::Relaxed);
+                // Send packets to pay off debt
+                let burst = (pace_debt as u64).min(64); // cap burst size
+                for _ in 0..burst {
+                    if send_shutdown.load(Ordering::Relaxed)
+                        || send_counters.state.load(Ordering::Relaxed) != 1
+                    {
+                        break;
+                    }
 
-                seq = seq.wrapping_add(payload_size as u32);
-                send_counters.highest_sent_seq.store(seq, Ordering::Relaxed);
+                    let pkt = build_tcp_packet(
+                        local_ip, config.server_addr, src_port, config.server_port,
+                        seq, out_ack.0.load(Ordering::Relaxed),
+                        TcpFlags::ACK | TcpFlags::PSH, 65535, &payload,
+                    );
 
-                if interval_ns > 10_000 {
-                    thread::sleep(Duration::from_nanos(interval_ns));
-                } else {
-                    std::hint::spin_loop();
+                    if let Err(e) = sender.send_to(&pkt, dst) {
+                        warn!("Send error: {e}");
+                        thread::sleep(Duration::from_millis(1));
+                        break;
+                    }
+
+                    send_counters.interval_sent.fetch_add(1, Ordering::Relaxed);
+                    send_counters.total_sent.fetch_add(1, Ordering::Relaxed);
+                    send_counters.interval_bytes_sent.fetch_add(payload_size as u64, Ordering::Relaxed);
+                    send_counters.total_bytes_sent.fetch_add(payload_size as u64, Ordering::Relaxed);
+
+                    seq = seq.wrapping_add(payload_size as u32);
+                    send_counters.highest_sent_seq.store(seq, Ordering::Relaxed);
+                    pace_debt -= 1.0;
                 }
+                // Cap debt to prevent burst accumulation after stalls
+                pace_debt = pace_debt.min(64.0);
             }
 
             // Send FIN on shutdown
@@ -384,44 +405,89 @@ pub fn run_client(config: TestConfig, src_port: u16, shutdown: Arc<AtomicBool>) 
         let mut rate_ctrl = RateController::new(config.multiplier, config.rate_base);
         let start = Instant::now();
         let mut last_report = Instant::now();
+        let mut last_congestion = Instant::now();
         let mut prev_highest_sent_seq = initial_seq;
         let mut prev_highest_recv_ack = initial_seq;
         let mut prev_highest_recv_data_seq = initial_ack;
+        let mut total_desired_sent: u64 = 0;
+        let mut total_acked_summary: u64 = 0;
+        // Separate counters for congestion updates (50ms granularity)
+        let mut congestion_sent: u64 = 0;
+        let mut congestion_acked: u64 = 0;
+        // Accumulators for congestion controller (need minimum sample size)
+        let mut cc_sent: u64 = 0;
+        let mut cc_acked: u64 = 0;
 
         while !shutdown.load(Ordering::Relaxed) && counters.state.load(Ordering::Relaxed) == 1 {
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(10));
 
-            if last_report.elapsed().as_secs_f64() >= config.interval_secs {
+            // === Congestion control update (every ~50ms, with minimum sample size) ===
+            if last_congestion.elapsed() >= Duration::from_millis(50) {
                 let sent = counters.interval_sent.swap(0, Ordering::Relaxed);
                 let acked = counters.interval_acked.swap(0, Ordering::Relaxed);
+                congestion_sent += sent;
+                congestion_acked += acked;
+                cc_sent += sent;
+                cc_acked += acked;
+
+                // Only update the controller when we have enough samples
+                // for a meaningful loss measurement (at least 10 packets).
+                // At low rates, this naturally extends the window.
+                if cc_sent >= 10 {
+                    rate_ctrl.update(cc_sent, cc_acked);
+                    cc_sent = 0;
+                    cc_acked = 0;
+
+                    // Update rate for send thread
+                    counters.rate_millipps.store(
+                        (rate_ctrl.rate() * 1000.0) as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+
+                last_congestion = Instant::now();
+            }
+
+            // === Display update (every interval_secs) ===
+            if last_report.elapsed().as_secs_f64() >= config.interval_secs {
+                let elapsed = last_report.elapsed().as_secs_f64();
                 let _bytes_sent = counters.interval_bytes_sent.swap(0, Ordering::Relaxed);
                 let bytes_recv = counters.interval_bytes_recv.swap(0, Ordering::Relaxed);
                 let retransmits = counters.interval_retransmits.swap(0, Ordering::Relaxed);
                 let recv_packets = counters.interval_recv_packets.swap(0, Ordering::Relaxed);
-                let elapsed = last_report.elapsed().as_secs_f64();
+
+                // Take accumulated congestion counters for this display interval
+                let sent = congestion_sent;
+                let acked = congestion_acked;
+                congestion_sent = 0;
+                congestion_acked = 0;
+                total_desired_sent += sent;
+                total_acked_summary += acked;
 
                 // Sequence tracking
                 let cur_highest_sent = counters.highest_sent_seq.load(Ordering::Relaxed);
                 let cur_highest_ack = counters.highest_recv_ack.load(Ordering::Relaxed);
                 let cur_highest_recv_data = counters.highest_recv_data_seq.load(Ordering::Relaxed);
 
-                rate_ctrl.update(sent, acked);
                 let t = start.elapsed().as_secs_f64();
 
                 // === SEND stats ===
                 if is_sender {
-                    // ACK window %: % of sent seq space that has been acked
-                    let seq_delta = cur_highest_sent.wrapping_sub(prev_highest_sent_seq);
-                    let ack_delta = cur_highest_ack.wrapping_sub(prev_highest_recv_ack);
-
-                    let ack_pct = if seq_delta > 0 {
-                        ack_delta as f64 / seq_delta as f64 * 100.0
+                    // ACK ratio: received ACK packets / sent data packets
+                    let ack_pct = if sent > 0 {
+                        acked as f64 / sent as f64 * 100.0
                     } else {
                         100.0
                     };
 
-                    // BW inferred from ACK advancement rate
-                    let inferred_bw = ack_delta as f64 * 8.0 / elapsed;
+                    // Seq delta for actual send throughput
+                    let seq_delta = cur_highest_sent.wrapping_sub(prev_highest_sent_seq);
+                    let ack_delta = cur_highest_ack.wrapping_sub(prev_highest_recv_ack);
+
+                    // BW inferred from ACK packet count (each ACK = one received payload)
+                    let inferred_bw = acked as f64 * payload_size as f64 * 8.0 / elapsed;
+                    // Actual send BW from seq advancement
+                    let actual_send_bw = seq_delta as f64 * 8.0 / elapsed;
 
                     let retransmit_str = if retransmit {
                         format!(" retx={retransmits}")
@@ -433,8 +499,9 @@ pub fn run_client(config: TestConfig, src_port: u16, shutdown: Arc<AtomicBool>) 
                         "[{t:6.1}s] SEND: seq={cur_highest_sent} ack={cur_highest_ack} \
                          delta_seq={seq_delta} delta_ack={ack_delta} \
                          ack_recv={ack_pct:.1}%{retransmit_str} \
-                         rate={:.0}pps BW(inferred)={}",
+                         rate={:.0}pps TX={} BW(inferred)={}",
                         rate_ctrl.rate(),
+                        format_bps(actual_send_bw),
                         format_bps(inferred_bw),
                     );
 
@@ -465,12 +532,6 @@ pub fn run_client(config: TestConfig, src_port: u16, shutdown: Arc<AtomicBool>) 
                     prev_highest_recv_data_seq = cur_highest_recv_data;
                 }
 
-                // Update rate for send thread
-                counters.rate_millipps.store(
-                    (rate_ctrl.rate() * 1000.0) as u64,
-                    Ordering::Relaxed,
-                );
-
                 last_report = Instant::now();
             }
         }
@@ -485,16 +546,16 @@ pub fn run_client(config: TestConfig, src_port: u16, shutdown: Arc<AtomicBool>) 
         let _ = recv_handle.join();
 
         // Print summary
-        print_summary(&counters, start.elapsed().as_secs_f64(), is_sender, is_receiver, payload_size, initial_seq, initial_ack);
+        print_summary(&counters, start.elapsed().as_secs_f64(), is_sender, is_receiver, payload_size, initial_seq, initial_ack, total_desired_sent, total_acked_summary);
     } else {
         // reverse-only mode: run recv on main thread
         recv_fn();
         // print summary
-        print_summary(&counters, 0.0, is_sender, is_receiver, payload_size, initial_seq, initial_ack);
+        print_summary(&counters, 0.0, is_sender, is_receiver, payload_size, initial_seq, initial_ack, 0, 0);
     }
 }
 
-fn print_summary(counters: &SharedCounters, elapsed: f64, is_sender: bool, is_receiver: bool, _payload_size: u16, initial_seq: u32, initial_ack: u32) {
+fn print_summary(counters: &SharedCounters, elapsed: f64, is_sender: bool, is_receiver: bool, _payload_size: u16, initial_seq: u32, initial_ack: u32, total_desired_sent: u64, total_acked_summary: u64) {
     let total_bytes_sent = counters.total_bytes_sent.load(Ordering::Relaxed);
     let total_bytes_recv = counters.total_bytes_recv.load(Ordering::Relaxed);
     let total_retransmits = counters.retransmit_count.load(Ordering::Relaxed);
@@ -509,12 +570,19 @@ fn print_summary(counters: &SharedCounters, elapsed: f64, is_sender: bool, is_re
 
         let seq_span = highest_sent.wrapping_sub(initial_seq);
         let ack_span = highest_ack.wrapping_sub(initial_seq);
-        let ack_pct = if seq_span > 0 {
+        // ACK recv%: total acked / total sent (packet counts, matches periodic)
+        let ack_pct = if total_desired_sent > 0 {
+            total_acked_summary as f64 / total_desired_sent as f64 * 100.0
+        } else if seq_span > 0 {
             ack_span as f64 / seq_span as f64 * 100.0
         } else {
             100.0
         };
-        let inferred_bw = if elapsed > 0.0 { ack_span as f64 * 8.0 / elapsed } else { 0.0 };
+        let inferred_bw = if elapsed > 0.0 {
+            total_acked_summary as f64 * _payload_size as f64 * 8.0 / elapsed
+        } else {
+            0.0
+        };
 
         eprintln!("--- Sending ---");
         eprintln!("  Seq span:        {seq_span}");

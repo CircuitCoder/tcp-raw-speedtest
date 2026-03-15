@@ -80,6 +80,23 @@ fn handle_connection(
     params: TestParams,
     shutdown: Arc<AtomicBool>,
 ) {
+    // Resolve actual local IP if bound to 0.0.0.0, so that TCP checksums
+    // in outgoing packets are computed with the real source IP.
+    let local_ip = if local_ip.is_unspecified() {
+        match crate::socket::get_local_ip_for(remote_ip) {
+            Ok(ip) => {
+                info!("Resolved local IP for {remote_ip}: {ip}");
+                ip
+            }
+            Err(e) => {
+                error!("Cannot determine local IP for {remote_ip}: {e}");
+                return;
+            }
+        }
+    } else {
+        local_ip
+    };
+
     let server_isn: u32 = rand::rng().random();
     let dst = SocketAddrV4::new(remote_ip, remote_port);
 

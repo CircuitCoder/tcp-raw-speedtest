@@ -36,7 +36,7 @@ impl RateController {
             smoothed_loss: 0.0,
             target_loss,
             base,
-            alpha: 0.3,
+            alpha: 0.2,
             min_rate: 1.0,
             max_rate: 10_000_000.0, // 10M pps safety cap
         }
@@ -57,9 +57,16 @@ impl RateController {
         // Update smoothed loss with EMA
         self.smoothed_loss = self.alpha * loss + (1.0 - self.alpha) * self.smoothed_loss;
 
-        // Proportional controller: rate *= base^(target - observed)
+        // Quadratic-gain proportional controller:
+        //   power = error * |error| / target_loss
+        // This gives aggressive adjustment far from target (fast ramp-up)
+        // but very gentle adjustment near target (stable equilibrium).
+        // At error=0 (equilibrium): power=0, adjustment=1 (no change)
+        // At error=target (no loss): power=target, adjustment=base^target (~1.26 for base=2, target=0.33)
+        // At error=target/10 (near target): power=target/100, adjustment≈1.002 (barely moves)
         let error = self.target_loss - self.smoothed_loss;
-        let adjustment = self.base.powf(error);
+        let power = error * error.abs() / self.target_loss;
+        let adjustment = self.base.powf(power);
 
         // Clamp adjustment to prevent wild swings
         let adjustment = adjustment.clamp(0.5, 4.0);
